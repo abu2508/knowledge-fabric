@@ -30,7 +30,7 @@ def test_build_code_graph_populates_store_with_contains_and_calls_edges(store, n
     file_path = f"retention_service-{ns}.rb"
     build_code_graph({file_path: FIXTURE}, store)
 
-    # `store` is a real, shared Neptune cluster - scope every query to this
+    # `store` is a real, shared Neo4j database - scope every query to this
     # test's namespace so it isn't looking at other runs' leftover data.
     files = [n for n in store.nodes(node_type="file", partition="code") if ns in n]
     classes = [n for n in store.nodes(node_type="class", partition="code") if ns in n]

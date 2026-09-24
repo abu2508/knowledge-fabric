@@ -1,7 +1,23 @@
-# Infrastructure: Amazon Neptune
+# Infrastructure: Amazon Neptune (deprecated - kept only to tear it down)
 
-Terraform for the Neptune cluster `knowledge_fabric.graphrag.graphstore`
-connects to. Provisions:
+**`knowledge_fabric.graphrag.graphstore` no longer uses Neptune.** It's
+Neo4j now (see the main README's GraphRAG section) - a free AuraDB
+instance, no VPC/bastion reachability problem, no ~$80/month Serverless
+floor. This directory is kept only so the Neptune cluster provisioned
+while this was still the plan can be torn down cleanly:
+
+```bash
+cd infra
+terraform destroy
+```
+
+Don't build new work against this - it's dead infrastructure, not a
+second supported backend.
+
+---
+
+Terraform for the (deprecated) Neptune cluster this project briefly used.
+Provisioned:
 
 - A VPC with two private subnets (Neptune requires a subnet group across
   at least two AZs) and a Neptune subnet group

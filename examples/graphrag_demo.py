@@ -9,10 +9,10 @@ constant) so a successful run demonstrates the thing the spec is actually
 for.
 
 Requires:
-  - A reachable Neptune cluster (NEPTUNE_ENDPOINT / AWS_REGION / AWS
-    credentials - see infra/README.md)
-  - ANTHROPIC_API_KEY, for Laya (Claude Haiku 4.5) and the final answer
-    (Claude Opus 5)
+  - A reachable Neo4j database (NEO4J_URI / NEO4J_USER / NEO4J_PASSWORD -
+    a free AuraDB instance from neo4j.com/cloud/aura works)
+  - ANTHROPIC_API_KEY, for the final answer (Claude Opus 5) and for
+    HaikuLayaClient if you're using that instead of the real Laya package
 
 Usage:
     python examples/graphrag_demo.py

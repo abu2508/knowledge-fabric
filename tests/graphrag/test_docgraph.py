@@ -55,7 +55,7 @@ def test_build_document_graph_creates_chunks_entities_and_co_occurs_edges(store,
     chunks = build_document_graph([doc], store, chunk_size=1000)
 
     assert len(chunks) == 1
-    # `store` is a real, shared Neptune cluster - scope every query to this
+    # `store` is a real, shared Neo4j database - scope every query to this
     # test's namespace so it isn't looking at other runs' leftover data.
     doc_chunks = [n for n in store.nodes(node_type="doc_chunk", partition="doc") if ns in n]
     assert len(doc_chunks) == 1

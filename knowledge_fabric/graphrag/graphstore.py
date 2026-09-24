@@ -1,59 +1,52 @@
-"""Graph storage backed by Amazon Neptune (Gremlin), per the build spec's
-"NetworkX for local POC, Neptune for AWS" - this build targets Neptune
-directly, no local/in-memory substitute.
+"""Graph storage backed by Neo4j (AuraDB Free or self-hosted) via the
+official driver and Cypher.
 
 One `GraphStore` instance backs the whole fabric: the document graph and
 the code graph are stored as two logical partitions of the same underlying
-Neptune graph (each vertex carries a `partition` property, `"doc"` or
+Neo4j graph (every node carries a `partition` property, `"doc"` or
 `"code"`), and Phase 2's cross-reference edges are added directly onto it
-as a distinct edge label (`links_to`). This matches the spec's "three
-separate stores... plus a thin linking layer" at the logical level (each
-partition is queried and reasoned about independently) while keeping link
-storage literally "in the existing graph store" rather than standing up a
-fourth database.
+as a distinct relationship type (`links_to`). This matches the spec's
+"three separate stores... plus a thin linking layer" at the logical level
+(each partition is queried and reasoned about independently) while keeping
+link storage literally "in the existing graph store" rather than standing
+up a fourth database.
 
-Connection: Neptune's Gremlin endpoint over a SigV4-signed WebSocket
-(IAM database authentication - the standard way to reach Neptune from
-outside its VPC, e.g. through a bastion/proxy or VPC peering). Configure
-via environment variables:
+Connection: standard Neo4j Bolt driver auth. Configure via environment
+variables:
 
-    NEPTUNE_ENDPOINT   required - the cluster's Gremlin endpoint hostname
-    NEPTUNE_PORT       optional - defaults to 8182
-    AWS_REGION         optional - defaults to the boto3 session's region
+    NEO4J_URI       required - e.g. neo4j+s://xxxxxxxx.databases.neo4j.io
+    NEO4J_USER      optional - defaults to "neo4j"
+    NEO4J_PASSWORD  required
 
-Credentials are resolved the normal boto3 way (env vars, shared config,
-instance/task role, etc.) - this module never takes a key directly.
-
-See `infra/` for Terraform that provisions the cluster this module expects
-to find at `NEPTUNE_ENDPOINT`, and `infra/README.md` for why reaching it
-from outside AWS (e.g. this repo's own test suite, run from a machine that
-isn't inside the cluster's VPC) needs a bastion or proxy that Terraform
-does not yet stand up.
+An AuraDB Free instance (neo4j.com/cloud/aura) has a public endpoint, so
+unlike the Neptune/VPC path this module previously used, no bastion or
+VPC peering is needed to reach it from outside AWS.
 """
 
 from __future__ import annotations
 
 import os
+import re
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from typing import Any
 
-import boto3
-from botocore.auth import SigV4Auth
-from botocore.awsrequest import AWSRequest
-from gremlin_python.driver.driver_remote_connection import DriverRemoteConnection
-from gremlin_python.process.anonymous_traversal import traversal
-from gremlin_python.process.graph_traversal import __
-from gremlin_python.process.traversal import T, TextP
+from neo4j import GraphDatabase
 
-# Edge label used for confirmed cross-reference links between the document
-# graph and the code graph (Phase 2 of the spec). Kept distinct from
-# structural edges (contains/calls/co_occurs/mentions/imports) so traversal
-# code can tell a cross-graph hop from a same-graph one.
+# Relationship type used for confirmed cross-reference links between the
+# document graph and the code graph (Phase 2 of the spec). Kept distinct
+# from structural edges (contains/calls/co_occurs/mentions/imports) so
+# traversal code can tell a cross-graph hop from a same-graph one.
 LINK_EDGE_TYPE = "links_to"
 
 _RESERVED_KEYS = {"type", "partition"}
+_NODE_LABEL = "Entity"
+# Every edge_type this codebase uses is interpolated into Cypher query text
+# (Cypher relationship types can't be query-parametrized) - validated
+# against this pattern first as a defense-in-depth check, even though every
+# caller in this package only ever passes one of a small fixed set of
+# internal literals (mentions/co_occurs/contains/calls/imports/links_to).
+_SAFE_EDGE_TYPE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 @dataclass
@@ -67,90 +60,65 @@ class Link:
     reason: str = ""
 
 
-class NeptuneNotConfiguredError(RuntimeError):
-    """Raised when `NEPTUNE_ENDPOINT` isn't set and no connection was passed explicitly."""
+class Neo4jNotConfiguredError(RuntimeError):
+    """Raised when `NEO4J_URI`/`NEO4J_PASSWORD` aren't set and no driver was passed explicitly."""
 
 
-def _sigv4_headers(endpoint: str, port: int, region: str) -> dict[str, str]:
-    """Sign the Gremlin WebSocket handshake per Neptune's IAM-auth requirement.
-
-    Neptune's Gremlin endpoint, when IAM database authentication is
-    enabled, expects the WebSocket upgrade request signed like any other
-    `neptune-db` SigV4 request. `gremlinpython`'s `DriverRemoteConnection`
-    accepts arbitrary `headers`, so this signs a representative GET request
-    to `https://{endpoint}:{port}/gremlin` and forwards the resulting
-    `Authorization`/`X-Amz-Date`/`X-Amz-Security-Token` headers onto the
-    real `wss://` connection.
-    """
-    session = boto3.Session()
-    credentials = session.get_credentials()
-    if credentials is None:
-        raise NeptuneNotConfiguredError(
-            "No AWS credentials found (checked env vars, shared config, and "
-            "instance/task role via boto3). Neptune IAM auth needs a signed "
-            "request - configure credentials the normal boto3 way."
-        )
-
-    request = AWSRequest(method="GET", url=f"https://{endpoint}:{port}/gremlin")
-    request.context["timestamp"] = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    SigV4Auth(credentials, "neptune-db", region).add_auth(request)
-
-    headers = {
-        "Authorization": request.headers["Authorization"],
-        "X-Amz-Date": request.headers["X-Amz-Date"],
-        "Host": f"{endpoint}:{port}",
-    }
-    if "X-Amz-Security-Token" in request.headers:
-        headers["X-Amz-Security-Token"] = request.headers["X-Amz-Security-Token"]
-    return headers
+def _check_edge_type(edge_type: str) -> str:
+    if not _SAFE_EDGE_TYPE.match(edge_type):
+        raise ValueError(f"Unsafe edge_type for Cypher interpolation: {edge_type!r}")
+    return edge_type
 
 
 def connect(
     *,
-    endpoint: str | None = None,
-    port: int | None = None,
-    region: str | None = None,
-) -> DriverRemoteConnection:
-    """Open a SigV4-authenticated Gremlin connection to a Neptune cluster.
+    uri: str | None = None,
+    user: str | None = None,
+    password: str | None = None,
+):
+    """Open a Neo4j driver from `NEO4J_URI`/`NEO4J_USER`/`NEO4J_PASSWORD`
+    when the matching argument isn't passed explicitly.
 
-    Reads `NEPTUNE_ENDPOINT` / `NEPTUNE_PORT` / `AWS_REGION` when the
-    matching argument isn't passed explicitly. Raises
-    `NeptuneNotConfiguredError` if no endpoint is available anywhere -
-    there is no local/in-memory fallback in this build.
+    Raises `Neo4jNotConfiguredError` if no URI/password is available
+    anywhere - there is no local/in-memory fallback in this build.
     """
-    endpoint = endpoint or os.environ.get("NEPTUNE_ENDPOINT")
-    if not endpoint:
-        raise NeptuneNotConfiguredError(
-            "NEPTUNE_ENDPOINT is not set. This build stores graphs in Amazon "
-            "Neptune only - provision a cluster (see infra/) and set "
-            "NEPTUNE_ENDPOINT to its Gremlin endpoint hostname."
+    uri = uri or os.environ.get("NEO4J_URI")
+    if not uri:
+        raise Neo4jNotConfiguredError(
+            "NEO4J_URI is not set. This build stores graphs in Neo4j only - "
+            "create a free AuraDB instance (neo4j.com/cloud/aura) and set "
+            "NEO4J_URI to its connection URI."
         )
-    port = port or int(os.environ.get("NEPTUNE_PORT", "8182"))
-    region = region or os.environ.get("AWS_REGION") or boto3.Session().region_name
-    if not region:
-        raise NeptuneNotConfiguredError(
-            "No AWS region found - set AWS_REGION or configure a default region."
-        )
+    user = user or os.environ.get("NEO4J_USER", "neo4j")
+    password = password or os.environ.get("NEO4J_PASSWORD")
+    if not password:
+        raise Neo4jNotConfiguredError("NEO4J_PASSWORD is not set.")
 
-    headers = _sigv4_headers(endpoint, port, region)
-    return DriverRemoteConnection(f"wss://{endpoint}:{port}/gremlin", "g", headers=headers)
+    return GraphDatabase.driver(uri, auth=(user, password))
 
 
 class GraphStore:
-    """Thin wrapper over a Gremlin traversal source (`g`), talking to Neptune.
+    """Thin wrapper over a Neo4j driver, issuing Cypher.
 
-    Every write is an upsert (safe to call `add_node`/`add_edge` again for
-    the same id - properties are overwritten, not duplicated), so re-running
-    indexing is idempotent the same way NetworkX's dict-based graph was.
+    Every write is an upsert (`MERGE` - safe to call `add_node`/`add_edge`
+    again for the same id; properties are overwritten, not duplicated), so
+    re-running indexing is idempotent.
     """
 
-    def __init__(self, connection: DriverRemoteConnection | None = None, *, name: str = "graph") -> None:
+    def __init__(self, driver=None, *, name: str = "graph") -> None:
         self.name = name
-        self._connection = connection or connect()
-        self.g = traversal().withRemote(self._connection)
+        self.driver = driver or connect()
+        self._ensure_constraint()
+
+    def _ensure_constraint(self) -> None:
+        with self.driver.session() as session:
+            session.run(
+                f"CREATE CONSTRAINT IF NOT EXISTS FOR (n:{_NODE_LABEL}) "
+                "REQUIRE n.id IS UNIQUE"
+            )
 
     def close(self) -> None:
-        self._connection.close()
+        self.driver.close()
 
     def __enter__(self) -> "GraphStore":
         return self
@@ -161,72 +129,71 @@ class GraphStore:
     # -- nodes ----------------------------------------------------------
 
     def add_node(self, node_id: str, node_type: str, *, partition: str, **attrs: Any) -> None:
-        """Upsert a vertex. `partition` is `"doc"` or `"code"` (see module docstring)."""
-        traversal_ = (
-            self.g.V(node_id)
-            .fold()
-            .coalesce(__.unfold(), __.addV("entity").property(T.id, node_id))
-            .property("type", node_type)
-            .property("partition", partition)
-        )
-        for key, value in attrs.items():
-            if key in _RESERVED_KEYS:
-                continue
-            traversal_ = traversal_.property(key, value)
-        traversal_.iterate()
+        """Upsert a node. `partition` is `"doc"` or `"code"` (see module docstring)."""
+        props = {k: v for k, v in attrs.items() if k not in _RESERVED_KEYS}
+        with self.driver.session() as session:
+            session.run(
+                f"MERGE (n:{_NODE_LABEL} {{id: $id}}) "
+                "SET n.type = $type, n.partition = $partition, n += $props",
+                id=node_id,
+                type=node_type,
+                partition=partition,
+                props=props,
+            )
 
     def has_node(self, node_id: str) -> bool:
-        return self.g.V(node_id).has_next()
+        with self.driver.session() as session:
+            result = session.run(f"MATCH (n:{_NODE_LABEL} {{id: $id}}) RETURN n LIMIT 1", id=node_id)
+            return result.single() is not None
 
     def get_node(self, node_id: str) -> dict:
-        raw = self.g.V(node_id).value_map(True).next()
-        return _flatten_value_map(raw)
+        with self.driver.session() as session:
+            result = session.run(f"MATCH (n:{_NODE_LABEL} {{id: $id}}) RETURN properties(n) AS props", id=node_id)
+            record = result.single()
+            if record is None:
+                raise KeyError(node_id)
+            return dict(record["props"])
 
     def nodes(self, node_type: str | None = None, partition: str | None = None) -> list[str]:
-        t = self.g.V()
-        if node_type is not None:
-            t = t.has("type", node_type)
-        if partition is not None:
-            t = t.has("partition", partition)
-        return t.id_().to_list()
+        query = (
+            f"MATCH (n:{_NODE_LABEL}) "
+            "WHERE ($type IS NULL OR n.type = $type) "
+            "AND ($partition IS NULL OR n.partition = $partition) "
+            "RETURN n.id AS id"
+        )
+        with self.driver.session() as session:
+            result = session.run(query, type=node_type, partition=partition)
+            return [record["id"] for record in result]
 
     # -- structural edges (contains, calls, co_occurs, imports, mentions) --
 
     def add_edge(self, source: str, target: str, edge_type: str, **attrs: Any) -> None:
-        """Upsert a directed edge labeled `edge_type` from `source` to `target`."""
-        traversal_ = (
-            self.g.V(source)
-            .as_("a")
-            .V(target)
-            .coalesce(
-                __.in_e(edge_type).where(__.out_v().as_("a")),
-                __.add_e(edge_type).from_("a"),
+        """Upsert a directed edge typed `edge_type` from `source` to `target`."""
+        edge_type = _check_edge_type(edge_type)
+        with self.driver.session() as session:
+            session.run(
+                f"MATCH (a:{_NODE_LABEL} {{id: $source}}), (b:{_NODE_LABEL} {{id: $target}}) "
+                f"MERGE (a)-[r:{edge_type}]->(b) "
+                "SET r += $props",
+                source=source,
+                target=target,
+                props=attrs,
             )
-        )
-        for key, value in attrs.items():
-            traversal_ = traversal_.property(key, value)
-        traversal_.iterate()
 
     def edges(self, node_id: str, edge_type: str | None = None) -> list[tuple[str, str, dict]]:
-        """Outgoing edges from `node_id`, optionally filtered by label.
-
-        Always reads the edge's real Gremlin label into `edge_type` on the
-        returned dict - it isn't just echoed back from the `edge_type`
-        argument, which is `None` on the (common) unfiltered call.
-        """
-        t = self.g.V(node_id).out_e(edge_type) if edge_type else self.g.V(node_id).out_e()
-        results = (
-            t.project("target", "label", "props")
-            .by(__.in_v().id_())
-            .by(__.label())
-            .by(__.value_map())
-            .to_list()
+        """Outgoing edges from `node_id`, optionally filtered by type."""
+        rel_pattern = f"[r:{_check_edge_type(edge_type)}]" if edge_type else "[r]"
+        query = (
+            f"MATCH (n:{_NODE_LABEL} {{id: $id}})-{rel_pattern}->(m) "
+            "RETURN m.id AS target, properties(r) AS props, type(r) AS edge_type"
         )
         out = []
-        for row in results:
-            props = {k: (v[0] if isinstance(v, list) and len(v) == 1 else v) for k, v in row["props"].items()}
-            props["edge_type"] = row["label"]
-            out.append((node_id, row["target"], props))
+        with self.driver.session() as session:
+            result = session.run(query, id=node_id)
+            for record in result:
+                props = dict(record["props"])
+                props["edge_type"] = record["edge_type"]
+                out.append((node_id, record["target"], props))
         return out
 
     def neighbors(self, node_id: str, edge_type: str | None = None) -> list[str]:
@@ -234,8 +201,11 @@ class GraphStore:
 
     def predecessors(self, node_id: str, edge_type: str | None = None) -> list[str]:
         """Nodes with an edge (optionally of `edge_type`) pointing into `node_id`."""
-        t = self.g.V(node_id).in_e(edge_type) if edge_type else self.g.V(node_id).in_e()
-        return t.out_v().id_().to_list()
+        rel_pattern = f"[r:{_check_edge_type(edge_type)}]" if edge_type else "[r]"
+        query = f"MATCH (n:{_NODE_LABEL} {{id: $id}})<-{rel_pattern}-(m) RETURN m.id AS source"
+        with self.driver.session() as session:
+            result = session.run(query, id=node_id)
+            return [record["source"] for record in result]
 
     # -- cross-reference links (Phase 2 linking layer) -------------------
 
@@ -281,40 +251,28 @@ class GraphStore:
     # -- misc -------------------------------------------------------------
 
     def __len__(self) -> int:
-        return self.g.V().count().next()
+        with self.driver.session() as session:
+            return session.run(f"MATCH (n:{_NODE_LABEL}) RETURN count(n) AS c").single()["c"]
 
     def stats(self) -> dict:
-        return {"nodes": self.g.V().count().next(), "edges": self.g.E().count().next()}
+        with self.driver.session() as session:
+            nodes = session.run(f"MATCH (n:{_NODE_LABEL}) RETURN count(n) AS c").single()["c"]
+            edges = session.run(f"MATCH (:{_NODE_LABEL})-[r]->(:{_NODE_LABEL}) RETURN count(r) AS c").single()["c"]
+        return {"nodes": nodes, "edges": edges}
 
     def drop_by_id_token(self, token: str) -> None:
-        """Delete every vertex (and its incident edges) whose id contains `token`.
+        """Delete every node (and its incident edges) whose id contains `token`.
 
-        Neptune is a shared, persistent cluster - there's no cheap
-        per-test "fresh database". Callers that namespace the doc/file ids
-        they feed into indexing (see `tests/graphrag/conftest.py`'s `ns`
-        fixture) use this to clean up after themselves instead of leaving
-        data behind on every run. A substring match (not a prefix match)
-        because node ids are built as `<kind>:<doc_or_file_id>...`, so the
-        namespace token lands in the middle of the id, not at the start.
+        A shared, persistent database has no cheap per-test "fresh
+        database". Callers that namespace the doc/file ids they feed into
+        indexing (see `tests/graphrag/conftest.py`'s `ns` fixture) use this
+        to clean up after themselves instead of leaving data behind on
+        every run. A substring match (not a prefix match) because node ids
+        are built as `<kind>:<doc_or_file_id>...`, so the namespace token
+        lands in the middle of the id, not at the start.
         """
-        self.g.V().has(T.id, TextP.containing(token)).drop().iterate()
-
-
-def _flatten_value_map(raw: dict) -> dict:
-    """`value_map(True)` returns id/label directly but every property as a
-    single-item list - flatten to plain scalars, and expose id/label as
-    `type`-consistent keys matching what `add_node` wrote."""
-    out: dict[str, Any] = {}
-    for key, value in raw.items():
-        if key == T.id:
-            out["id"] = value
-        elif key == T.label:
-            continue  # vertex label is always "entity" here; `type` property carries the real type
-        elif isinstance(value, list) and len(value) == 1:
-            out[key] = value[0]
-        else:
-            out[key] = value
-    return out
+        with self.driver.session() as session:
+            session.run(f"MATCH (n:{_NODE_LABEL}) WHERE n.id CONTAINS $token DETACH DELETE n", token=token)
 
 
 def make_link(source: str, target: str, confidence: float, reason: str = "") -> Link:

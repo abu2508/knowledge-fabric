@@ -121,8 +121,8 @@ docs/*.md, *.txt          code/**/*.rb
       │                         │
       └────────────┬────────────┘
                     ▼
-              graphstore.py         one Neptune graph, two logical
-              (Amazon Neptune)      partitions ("doc" / "code")
+              graphstore.py         one Neo4j graph, two logical
+              (Neo4j / AuraDB)      partitions ("doc" / "code")
                     │
                     ▼
               linking.py            word-overlap candidates -> Laya
@@ -140,7 +140,7 @@ docs/*.md, *.txt          code/**/*.rb
 
 ```
 knowledge_fabric/graphrag/
-  graphstore.py   Neptune/Gremlin storage - the doc and code graphs are
+  graphstore.py   Neo4j storage (Cypher) - the doc and code graphs are
                   two logical partitions of one graph; links_to edges are
                   Phase 2's cross-reference layer, stored directly on it
   docgraph.py     Phase 1, document path: table extraction, recursive
@@ -152,23 +152,37 @@ knowledge_fabric/graphrag/
   linking.py      Phase 2: candidate generation + Laya/LLM confirmation
   retrieval.py    Phase 3: router + dynamic hop traversal + final answer
   pipeline.py     orchestration: index() -> link() -> query()
-infra/            Terraform: VPC + Neptune Serverless cluster + IAM policy
-                  (+ optional bastion - see infra/README.md)
-tests/graphrag/    unit tests (chunking, Tree-sitter parsing - no AWS
-                  needed) + Neptune-backed tests (skipped without a
-                  configured cluster - see "Running it" below)
+infra/            Deprecated Terraform for an earlier Neptune cluster -
+                  kept only to `terraform destroy` it (see infra/README.md)
+tests/graphrag/    unit tests (chunking, Tree-sitter parsing - no
+                  database needed) + Neo4j-backed tests (skipped without
+                  a configured database - see "Running it" below)
 examples/graphrag_demo.py   end-to-end demo against tests/fixtures/
 ```
+
+### Why Neo4j, not Neptune
+
+The build spec originally called for NetworkX locally / Amazon Neptune on
+AWS (and explicitly ruled out Neo4j). This build started there, provisioned
+a real Neptune Serverless cluster via Terraform, and hit two real costs of
+that choice: Neptune has no public endpoint (only reachable from inside
+its VPC - needs a bastion or VPC peering for anything outside AWS, this
+build environment included) and it bills continuously even idle (~1 NCU
+floor, no scale-to-zero, roughly $80/month left running). Given that, the
+project explicitly moved to **Neo4j** (a free AuraDB instance) instead -
+same graph-database role, but a public endpoint and a real free tier. The
+`infra/` Terraform for the abandoned Neptune cluster is kept only to tear
+it down; see `infra/README.md`.
 
 ### What's real vs. what's a documented stand-in
 
 | Piece | Status |
 |---|---|
 | Chunking, table extraction, Tree-sitter code parsing, graph construction, candidate generation, hop traversal logic | Real, tested (see "Running it") |
-| **Neptune storage** (`graphstore.py`) | Real Gremlin + IAM SigV4 client code, written against Neptune's documented API. **Not yet exercised against a live cluster** - this build environment's network policy doesn't reach AWS service endpoints, and no cluster was provisioned from here. See `infra/README.md`. |
-| **Laya** (`laya.py`) | Uses the real `laya` PyPI package (Convai Innovations' "System 1": input state + typed questions in, structured answer + calibrated probability out, one non-autoregressive forward pass) via `LayaClient`, the default everywhere. Written against the installed package's actual `Agent.predict`/`system_one` API and its `"noul"` question type (calibrated P(true) on a yes/no question). **Not yet exercised end to end**: `Agent(...)` downloads its checkpoint from Hugging Face on first use, and this environment's network policy blocks `huggingface.co`. `HaikuLayaClient` (same `score()` interface, a structured-output call to Claude Haiku 4.5) is a documented, explicitly-opt-in alternative for environments where the Laya checkpoint isn't reachable - pass it as `laya=HaikuLayaClient()` to `link()`/`query()`. |
-| **Noun-phrase extraction** (`docgraph.extract_noun_phrases`) | The spec calls for spaCy-style grammar-based extraction. This environment's network policy blocks downloading a spaCy language model (spaCy the package installs fine from PyPI; `en_core_web_sm` does not), so it's a mechanical stopword-filtered word-run extractor instead - same "mechanical span extraction, not summarization" property, swappable via the same function signature. |
-| **Real OpenProject benchmark data** | Not pulled. This environment's network policy blocks general web access (`openproject.org`, `github.com/opf/openproject`) and that repo isn't in this session's GitHub scope. `tests/fixtures/` has a small hand-written policy doc + Ruby service instead, used only for unit tests and the demo script - not a substitute for the real benchmark. See "Getting to the real benchmark" below. |
+| **Neo4j storage** (`graphstore.py`) | Real driver + Cypher code, written against the official `neo4j` Python driver. Not yet exercised against a live AuraDB instance from this session - needs `NEO4J_URI`/`NEO4J_PASSWORD` for an instance you create at neo4j.com/cloud/aura (a manual signup step). |
+| **Laya** (`laya.py`) | Uses the real `laya` PyPI package (Convai Innovations' "System 1": input state + typed questions in, structured answer + calibrated probability out, one non-autoregressive forward pass) via `LayaClient`, the default everywhere. **Verified working end to end**: the checkpoint was downloaded from Hugging Face and a real prediction ran successfully in this build environment. `HaikuLayaClient` (same `score()` interface, a structured-output call to Claude Haiku 4.5) remains as a documented, explicitly-opt-in alternative - pass it as `laya=HaikuLayaClient()` to `link()`/`query()`. |
+| **Noun-phrase extraction** (`docgraph.extract_noun_phrases`) | The spec calls for spaCy-style grammar-based extraction. Implemented as a mechanical stopword-filtered word-run extractor instead of a spaCy pipeline (no model dependency) - same "mechanical span extraction, not summarization" property, swappable via the same function signature. |
+| **Real OpenProject benchmark data** | Confirmed reachable (the real `opf/openproject` repo clones successfully, including its GDPR/security/privacy docs) but not yet pulled into this repo's benchmark data - see "Getting to the real benchmark" below. |
 | SQL/schema store path | **Descoped**, per the spec - not built. |
 | Evaluation methodology, cost-vs-baseline methodology | Open per the spec - not yet decided, so not built. |
 
@@ -176,26 +190,19 @@ examples/graphrag_demo.py   end-to-end demo against tests/fixtures/
 
 The spec calls for eyeballing the noun phrases the extractor pulls from
 real OpenProject policy sentences before trusting Phase 2 on top of it.
-That hasn't happened - there's no real OpenProject text to eyeball yet.
-Run `knowledge_fabric.graphrag.docgraph.review_noun_phrases(text)` against
-real policy text once it's available, and read the output, before relying
+That hasn't happened yet - there's no real OpenProject text ingested yet
+(see "Getting to the real benchmark"). Run
+`knowledge_fabric.graphrag.docgraph.review_noun_phrases(text)` against
+real policy text once it's ingested, and read the output, before relying
 on linking-layer results.
 
 ### Getting to the real benchmark
 
-Two things are blocking real OpenProject data and a live Neptune run, both
-environment-level, not code-level:
-
-1. **OpenProject data.** From a session whose network policy allows
-   general web access (or with `opf/openproject` forked into a GitHub org
-   this session can reach), pull the published GDPR/security/privacy
-   policy pages as the document corpus, and the codebase modules
-   implementing data deletion/retention as the code corpus - `index()`
-   takes any directory of `.md`/`.txt` docs and `.rb` files, so no code
-   changes are needed once the data is reachable.
-2. **A live Neptune cluster.** `cd infra && terraform apply` (see
-   `infra/README.md` - it also covers reaching Neptune from outside its
-   VPC, which this build's own test environment can't do either).
+Network access to OpenProject's data is confirmed working - what's left is
+pulling the specific GDPR/security/privacy policy pages as the document
+corpus and the codebase modules implementing data deletion/retention as
+the code corpus, then running `index()` on them (it takes any directory of
+`.md`/`.txt` docs and `.rb` files, so no code changes are needed).
 
 ### Running it
 
@@ -203,14 +210,15 @@ environment-level, not code-level:
 pip install -r requirements.txt   # or: pip install -e ".[graphrag]"
 
 # Pure-logic tests - chunking, table extraction, Tree-sitter parsing.
-# No AWS needed.
+# No database needed.
 pytest tests/graphrag/
 
-# Once a cluster exists (infra/) and credentials are set:
-export NEPTUNE_ENDPOINT=<cluster endpoint>
-export AWS_REGION=<region>
+# Once you have a Neo4j database (a free AuraDB instance works):
+export NEO4J_URI=neo4j+s://xxxxxxxx.databases.neo4j.io
+export NEO4J_USER=neo4j
+export NEO4J_PASSWORD=...
 export ANTHROPIC_API_KEY=sk-ant-...
-pytest tests/graphrag/                     # now runs the Neptune-backed tests too
+pytest tests/graphrag/                     # now runs the Neo4j-backed tests too
 python examples/graphrag_demo.py           # indexes, links, and queries the fixture data end to end
 ```
 
