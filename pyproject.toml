@@ -9,7 +9,8 @@ dependencies = []
 [project.optional-dependencies]
 qa = ["anthropic>=0.40"]
 graphrag = [
-    "anthropic>=0.40",
+    "anthropic>=0.40",  # HaikuLayaClient fallback + Phase 2/3 LLM calls
+    "laya>=0.3.11",     # real Laya typed-decision model (Convai Innovations)
     "tree-sitter>=0.23",
     "tree-sitter-ruby>=0.23",
     "boto3>=1.34",
